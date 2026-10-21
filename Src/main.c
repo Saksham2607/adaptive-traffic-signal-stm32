@@ -1,13 +1,15 @@
 /*
- * Adaptive Traffic Signal - Step 3: IR TIME-OCCUPANCY green time
+ * Adaptive Traffic Signal - Step 4: IR VEHICLE COUNTING (IN / OUT sensors)
  * STM32F103C8T6, register-level (no HAL)
  *
- * Method: while a lane is waiting (red), its IR sensor is sampled every
- * 20 ms. Occupancy % = (samples with vehicle present) / (all samples) * 100.
+ * Method: each monitored lane has an IN sensor (start of the stretch) and
+ * an OUT sensor (stop line). A vehicle blocking a sensor is counted once,
+ * at the moment the sensor goes from clear to blocked.
+ *     IN event  -> queue + 1
+ *     OUT event -> queue - 1   (never below 0)
  * When the lane turns green:
- *     green = MIN + occupancy% * (MAX - MIN) / 100
- * then its statistics reset. A sensor that is blocked the whole time
- * (queue of stopped cars) therefore gives the maximum green.
+ *     green = MIN + queue * MS_PER_VEHICLE, capped at MAX
+ * Lanes with no sensors always get the minimum green.
  */
 
 #include "stm32f1xx.h"
@@ -35,8 +37,10 @@ enum { RED = 0, YELLOW = 1, GREEN = 2 };
 #define YELLOW_MS        2000u
 #define ALL_RED_MS       1000u   /* safety gap between lanes */
 
-#define MIN_GREEN_MS     5000u   /* green at 0 % occupancy             */
-#define MAX_GREEN_MS     15000u  /* green at 100 % occupancy           */
+#define MIN_GREEN_MS     5000u   /* green with an empty queue          */
+#define MAX_GREEN_MS     15000u  /* green is never longer than this    */
+#define MS_PER_VEHICLE   2000u   /* extra green per queued vehicle     */
+                                 /* (placeholder - tune from your demo) */
 
 /* ---------- IR sensor settings ---------- */
 /* Most LM393 IR modules pull OUT LOW when an object is detected.
@@ -45,6 +49,16 @@ enum { RED = 0, YELLOW = 1, GREEN = 2 };
 
 #define IR_SAMPLE_MS     20u     /* sampling period                    */
 #define IR_DEBOUNCE_N    3u      /* samples that must agree (3x20=60ms)*/
+
+/* Sensor number s is wired to pin PB(12 + s):
+ *   sensor 0 = PB12   sensor 1 = PB13   sensor 2 = PB14   sensor 3 = PB15 */
+#define NUM_SENSORS      4
+#define NO_SENSOR        0xFF
+#define QUEUE_MAX        20      /* queue never counts above this      */
+
+/* Which sensor is each lane's IN and OUT sensor (NO_SENSOR = none) */
+static const uint8_t lane_in_sensor[NUM_LANES]  = { 0, 1, NO_SENSOR, NO_SENSOR };
+static const uint8_t lane_out_sensor[NUM_LANES] = { 2, 3, NO_SENSOR, NO_SENSOR };
 
 /* ---------- Millisecond tick ---------- */
 static volatile uint32_t ms_ticks = 0;
@@ -113,67 +127,58 @@ static uint32_t phase_len   = ALL_RED_MS;
 /* Seconds left in the current phase (for LCD / 7-segment later) */
 static volatile uint32_t countdown_s = 0;
 
-/* ---------- IR density logic ---------- */
-static uint32_t occ_samples[NUM_LANES];    /* samples with vehicle present */
-static uint32_t wait_samples[NUM_LANES];   /* all samples while waiting    */
-static uint8_t  ir_stable[NUM_LANES];      /* debounced sensor state       */
-static volatile uint8_t occupancy_pct[NUM_LANES];  /* last result, for LCD */
+/* ---------- IR vehicle counting ---------- */
+static uint8_t ir_stable[NUM_SENSORS];     /* debounced sensor state       */
+static uint8_t queue_len[NUM_LANES];       /* vehicles waiting, per lane   */
 
 /* Raw sensor reading: 1 = vehicle present */
-static inline uint8_t ir_raw(uint8_t lane)
+static inline uint8_t ir_raw(uint8_t sensor)
 {
-    uint8_t bit = (GPIOB->IDR >> (12 + lane)) & 1u;   /* PB12..PB15 */
+    uint8_t bit = (GPIOB->IDR >> (12 + sensor)) & 1u;   /* PB12..PB15 */
     return IR_ACTIVE_LOW ? !bit : bit;
 }
 
-/* Sample only while that lane is waiting (not green/yellow).
- * The ALL_RED gap after a lane's own turn counts as waiting again. */
-static inline uint8_t lane_is_waiting(uint8_t lane)
+/* One vehicle just blocked this sensor: update the lane that owns it */
+static void count_event(uint8_t sensor)
 {
-    return !(lane == active_lane && phase != PH_ALL_RED);
+    for (uint8_t l = 0; l < NUM_LANES; l++) {
+        if (lane_in_sensor[l] == sensor) {
+            if (queue_len[l] < QUEUE_MAX) queue_len[l]++;
+        }
+        if (lane_out_sensor[l] == sensor) {
+            if (queue_len[l] > 0) queue_len[l]--;
+        }
+    }
 }
 
 static void ir_update(void)
 {
     static uint32_t last_sample = 0;
-    static uint8_t  agree[NUM_LANES];    /* consecutive differing samples */
+    static uint8_t  agree[NUM_SENSORS];  /* consecutive differing samples */
 
     if ((ms_ticks - last_sample) < IR_SAMPLE_MS) return;
     last_sample = ms_ticks;
 
-    for (uint8_t l = 0; l < NUM_LANES; l++) {
+    for (uint8_t s = 0; s < NUM_SENSORS; s++) {
         /* debounce */
-        uint8_t r = ir_raw(l);
-        if (r != ir_stable[l]) {
-            if (++agree[l] >= IR_DEBOUNCE_N) {
-                ir_stable[l] = r;
-                agree[l]     = 0;
+        uint8_t r = ir_raw(s);
+        if (r != ir_stable[s]) {
+            if (++agree[s] >= IR_DEBOUNCE_N) {
+                ir_stable[s] = r;
+                agree[s]     = 0;
+                if (r) count_event(s);   /* clear -> blocked = one vehicle */
             }
         } else {
-            agree[l] = 0;
-        }
-
-        /* occupancy bookkeeping */
-        if (lane_is_waiting(l)) {
-            wait_samples[l]++;
-            if (ir_stable[l]) occ_samples[l]++;
+            agree[s] = 0;
         }
     }
 }
 
-/* Called when a lane turns green: convert occupancy % to green time,
- * then reset that lane's statistics. */
+/* Called when a lane turns green: queue length -> green time */
 static uint32_t compute_green_ms(uint8_t lane)
 {
-    uint32_t pct = 0;
-    if (wait_samples[lane] > 0) {
-        pct = (occ_samples[lane] * 100u) / wait_samples[lane];
-    }
-    occupancy_pct[lane] = (uint8_t)pct;
-    occ_samples[lane]   = 0;
-    wait_samples[lane]  = 0;
-
-    return MIN_GREEN_MS + (pct * (MAX_GREEN_MS - MIN_GREEN_MS)) / 100u;
+    uint32_t ms = MIN_GREEN_MS + (uint32_t)queue_len[lane] * MS_PER_VEHICLE;
+    return (ms > MAX_GREEN_MS) ? MAX_GREEN_MS : ms;
 }
 
 /* ---------- State machine ---------- */
@@ -186,7 +191,7 @@ static void enter_phase(Phase p)
     case PH_GREEN:
         all_lanes_red();
         lane_set(active_lane, GREEN);
-        phase_len = compute_green_ms(active_lane);   /* also resets stats */
+        phase_len = compute_green_ms(active_lane);
         break;
 
     case PH_YELLOW:
@@ -237,8 +242,8 @@ int main(void)
             gpio_set_output(lane_pins[l][c].port, lane_pins[l][c].pin);
 
     /* 4 IR sensors: PB12..PB15 as inputs with pull-up */
-    for (uint8_t l = 0; l < NUM_LANES; l++)
-        gpio_set_input_pullup(GPIOB, 12 + l);
+    for (uint8_t s = 0; s < NUM_SENSORS; s++)
+        gpio_set_input_pullup(GPIOB, 12 + s);
 
     /* Onboard LED PC13 (active-low) used as a heartbeat */
     gpio_set_output(GPIOC, 13);
