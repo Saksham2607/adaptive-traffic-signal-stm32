@@ -1,30 +1,3 @@
-/*
- * Adaptive Traffic Signal - Step 5
- * 4 lanes, 8 IR sensors (IN + OUT per lane), 4 pedestrian buttons,
- * 4 emergency buttons.   STM32F103C8T6, register-level (no HAL)
- *
- * NOT YET COMPILED OR FLASHED - build it first and report any errors.
- *
- * Green time when a lane turns green:
- *     green = MIN + queue * MS_PER_VEHICLE            (5 s ... 15 s)
- *     if that lane's pedestrian button was pushed:   green >= 7 s
- *     if it was pushed three times together:         green >= 12 s
- * Emergency button of lane E:
- *     current green lane -> yellow 2 s -> lane E green 12 s
- *     (if lane E is already green, it just stays green for 12 s)
- *
- * PIN MAP
- *   Lane LEDs  (R,Y,G): L1 PA0,PA1,PA2   L2 PA3,PA4,PA5
- *                       L3 PA6,PA7,PB0   L4 PB1,PB10,PB11
- *   IR sensors: s0 PB12 (L1 IN)   s1 PB13 (L2 IN)
- *               s2 PB14 (L1 OUT)  s3 PB15 (L2 OUT)
- *               s4 PA8  (L3 IN)   s5 PA9  (L4 IN)
- *               s6 PA10 (L3 OUT)  s7 PB9  (L4 OUT)
- *   Emergency buttons (to GND): L1 PB3, L2 PB4, L3 PB5, L4 PB6
- *   Pedestrian buttons (to GND): L1 PB7, L2 PB8, L3 PA11, L4 PA15
- *   Heartbeat: PC13 (onboard LED)       Spare: PA12
- */
-
 #include "stm32f1xx.h"
 #include <stdint.h>
 
@@ -47,70 +20,63 @@ static const PinDef lane_pins[NUM_LANES][3] = {
 
 enum { RED = 0, YELLOW = 1, GREEN = 2 };
 
+static const PinDef em_pins[NUM_LANES] = {      /* emergency buttons */
+    {GPIOB, 3}, {GPIOB, 4}, {GPIOB, 5}, {GPIOB, 6}
+};
+
+static const PinDef buzzer_pin = {GPIOA, 11};
+
+static const PinDef tm_clk = {GPIOB, 8};        /* shared TM1637 clock */
+static const PinDef tm_dio[NUM_LANES] = {       /* one data pin per lane */
+    {GPIOB, 9}, {GPIOA, 8}, {GPIOA, 9}, {GPIOA, 10}
+};
+
+/* Software I2C pins */
+#define SCL_PORT GPIOB
+#define SCL_PIN  7
+#define SDA_PORT GPIOA
+#define SDA_PIN  15
+
+/* I2C device addresses (7-bit) */
+#define LCD_ADDR   0x27   /* try 0x3F if the LCD stays blank */
+#define EXPA_ADDR  0x20   /* pedestrian LEDs   (PCF8574, A0..A2 = GND)  */
+#define EXPB_ADDR  0x21   /* ped buttons + IR  (PCF8574, A0 = 3.3 V)    */
+
 /* ---------- Timing (ms) - tune these for your demo ---------- */
 #define YELLOW_MS                 2000u
 #define ALL_RED_MS                1000u   /* safety gap between lanes      */
 
-#define MIN_GREEN_MS              5000u   /* green with an empty queue     */
-#define MAX_GREEN_MS              15000u  /* green is never longer         */
-#define MS_PER_VEHICLE            2000u   /* extra green per queued vehicle */
-                                          /* (placeholder - tune on demo)  */
+#define EXT_MIN_MS                5000u   /* minimum green (extension phase) */
+#define EXT_MAX_MS                15000u  /* extension never longer          */
+#define COUNTDOWN_S               9u      /* countdown after extension ends  */
+#define COUNTDOWN_MS              (COUNTDOWN_S * 1000u)
 
-#define PED_MIN_GREEN_MS          7000u   /* pedestrian button pushed      */
+#define PED_MIN_GREEN_MS          7000u   /* pedestrian pushed: min green  */
 #define PED_ELDERLY_MIN_GREEN_MS  12000u  /* pushed three times together   */
-#define PED_MULTI_COUNT           3u      /* presses that make elderly mode */
-#define PED_MULTI_WINDOW_MS       3000u   /* all presses within this time  */
+#define PED_MULTI_COUNT           3u
+#define PED_MULTI_WINDOW_MS       3000u
 
-#define EMERGENCY_GREEN_MS        12000u  /* emergency lane green time     */
+#define EMERGENCY_GREEN_MS        12000u
 
-#define RECOVERY_BONUS_MS         3000u   /* extra green after an emergency */
-#define RECOVERY_GREENS           8u      /* 2 full cycles; set 0 to disable */
+#define RECOVERY_BONUS_MS         3000u   /* extra minimum green afterwards */
+#define RECOVERY_GREENS           8u      /* 2 full cycles; 0 = disable     */
 
-#define BTN_DEBOUNCE_MS           50u     /* ignore button edges closer    */
+#define BTN_DEBOUNCE_MS           50u     /* emergency buttons (interrupt)  */
+#define BTN_DEBOUNCE_N            2u      /* pedestrian buttons (2x20 ms)   */
+
+#define BEEP_ON_MS                80u
+#define BEEP_OFF_MS               120u
+#define LCD_BUILD_MS              250u
 
 /* ---------- IR sensor settings ---------- */
-/* Most LM393 IR modules pull OUT LOW when an object is detected.
- * If your modules do the opposite, change this to 0. */
-#define IR_ACTIVE_LOW    1
-
-#define IR_SAMPLE_MS     20u     /* sampling period                    */
-#define IR_DEBOUNCE_N    3u      /* samples that must agree (3x20=60ms)*/
-
+#define IR_ACTIVE_LOW    1     /* LM393 modules: OUT is LOW when blocked */
+#define IR_SAMPLE_MS     20u
+#define IR_DEBOUNCE_N    3u
 #define NUM_SENSORS      8
-#define NO_SENSOR        0xFF
-#define QUEUE_MAX        20      /* queue never counts above this      */
+#define QUEUE_MAX        20
 
-/* Sensor number -> pin */
-static const PinDef ir_pins[NUM_SENSORS] = {
-    {GPIOB, 12}, {GPIOB, 13}, {GPIOB, 14}, {GPIOB, 15},   /* s0..s3 */
-    {GPIOA, 8},  {GPIOA, 9},  {GPIOA, 10}, {GPIOB, 9}     /* s4..s7 */
-};
-
-/* Which sensor is each lane's IN and OUT sensor */
 static const uint8_t lane_in_sensor[NUM_LANES]  = { 0, 1, 4, 5 };
 static const uint8_t lane_out_sensor[NUM_LANES] = { 2, 3, 6, 7 };
-
-/* ---------- Buttons (all use EXTI interrupts, active-low) ---------- */
-typedef enum { BTN_EMERGENCY, BTN_PED } BtnKind;
-
-typedef struct {
-    GPIO_TypeDef *port;
-    uint8_t       pin;
-    BtnKind       kind;
-    uint8_t       lane;
-} ButtonDef;
-
-#define NUM_BUTTONS 8
-static const ButtonDef buttons[NUM_BUTTONS] = {
-    { GPIOB, 3,  BTN_EMERGENCY, 0 },
-    { GPIOB, 4,  BTN_EMERGENCY, 1 },
-    { GPIOB, 5,  BTN_EMERGENCY, 2 },
-    { GPIOB, 6,  BTN_EMERGENCY, 3 },
-    { GPIOB, 7,  BTN_PED,       0 },
-    { GPIOB, 8,  BTN_PED,       1 },
-    { GPIOA, 11, BTN_PED,       2 },
-    { GPIOA, 15, BTN_PED,       3 }
-};
 
 /* ---------- Millisecond tick ---------- */
 static volatile uint32_t ms_ticks = 0;
@@ -120,42 +86,53 @@ void SysTick_Handler(void)
     ms_ticks++;
 }
 
-/* ---------- GPIO helpers (STM32F1: CRL/CRH, not MODER) ---------- */
-static void gpio_set_output(GPIO_TypeDef *port, uint8_t pin)
+static void delay_ms(uint32_t ms)       /* only used during start-up */
 {
-    /* MODE=10 (2 MHz output), CNF=00 (push-pull) -> 0b0010 */
+    uint32_t t = ms_ticks;
+    while ((ms_ticks - t) < ms) { }
+}
+
+/* Rough microsecond delay (at least about 'us'; clock speed independent) */
+static void udelay(uint32_t us)
+{
+    volatile uint32_t n = us * (SystemCoreClock / 3000000u) + 1u;
+    while (n--) { __NOP(); }
+}
+
+/* ---------- GPIO helpers (STM32F1: CRL/CRH, not MODER) ---------- */
+static void gpio_cfg(GPIO_TypeDef *port, uint8_t pin, uint32_t nibble)
+{
     if (pin < 8) {
         port->CRL &= ~(0xFu << (pin * 4));
-        port->CRL |=  (0x2u << (pin * 4));
+        port->CRL |=  (nibble << (pin * 4));
     } else {
         uint8_t p = pin - 8;
         port->CRH &= ~(0xFu << (p * 4));
-        port->CRH |=  (0x2u << (p * 4));
+        port->CRH |=  (nibble << (p * 4));
     }
 }
 
+static void gpio_set_output(GPIO_TypeDef *port, uint8_t pin)
+{   /* MODE=10 (2 MHz), CNF=00 push-pull */
+    gpio_cfg(port, pin, 0x2u);
+}
+
+static void gpio_set_output_od(GPIO_TypeDef *port, uint8_t pin)
+{   /* MODE=10 (2 MHz), CNF=01 open-drain (for I2C) */
+    gpio_cfg(port, pin, 0x6u);
+}
+
 static void gpio_set_input_pullup(GPIO_TypeDef *port, uint8_t pin)
-{
-    /* MODE=00 (input), CNF=10 (pull-up/pull-down) -> 0b1000,
-     * then ODR bit = 1 selects pull-UP */
-    if (pin < 8) {
-        port->CRL &= ~(0xFu << (pin * 4));
-        port->CRL |=  (0x8u << (pin * 4));
-    } else {
-        uint8_t p = pin - 8;
-        port->CRH &= ~(0xFu << (p * 4));
-        port->CRH |=  (0x8u << (p * 4));
-    }
+{   /* MODE=00, CNF=10, ODR=1 selects pull-UP */
+    gpio_cfg(port, pin, 0x8u);
     port->ODR |= (1u << pin);
 }
 
 static inline void pin_write(const PinDef *p, uint8_t on)
 {
-    /* BSRR: low 16 bits set, high 16 bits reset (atomic) */
     p->port->BSRR = on ? (1u << p->pin) : (1u << (p->pin + 16));
 }
 
-/* Set one lane to exactly one colour */
 static void lane_set(uint8_t lane, uint8_t colour)
 {
     for (uint8_t c = 0; c < 3; c++) {
@@ -169,103 +146,474 @@ static void all_lanes_red(void)
 }
 
 /* ---------- State machine variables ---------- */
-typedef enum { PH_GREEN, PH_YELLOW, PH_ALL_RED, PH_EM_GREEN } Phase;
+typedef enum {
+    PH_GREEN_EXT,     /* green, extending while cars remain */
+    PH_GREEN_CLEAR,   /* green, 9..0 countdown               */
+    PH_YELLOW,
+    PH_ALL_RED,
+    PH_EM_GREEN       /* emergency green                     */
+} Phase;
+
+static const char *const phase_names[5] = {
+    "GREEN", "CLEAR", "YELLW", "ALLRD", "EMERG"
+};
 
 static Phase    phase       = PH_ALL_RED;
 static uint8_t  active_lane = NUM_LANES - 1;   /* first advance -> lane 0 */
 static uint32_t phase_start = 0;
 static uint32_t phase_len   = ALL_RED_MS;
+static uint32_t ext_floor_ms = EXT_MIN_MS;     /* earliest end of extension */
 
-static uint8_t  em_next       = NO_LANE;  /* emergency lane to serve after yellow */
-static uint8_t  recovery_left = 0;        /* greens still getting the bonus       */
+static uint8_t  em_next       = NO_LANE;   /* emergency lane after the yellow */
+static uint8_t  recovery_left = 0;
 
-/* Seconds left in the current phase (for LCD / 7-segment later) */
-static volatile uint32_t countdown_s = 0;
+static volatile uint32_t countdown_s = 0;  /* seconds left (0 during GREEN) */
 
-/* ---------- Button flags (set in interrupts, used in main loop) ---------- */
-static volatile uint8_t em_req[NUM_LANES];      /* emergency requested       */
-static volatile uint8_t ped_req[NUM_LANES];     /* pedestrian button pushed  */
-static volatile uint8_t ped_elderly[NUM_LANES]; /* pushed 3x together        */
-static uint8_t  ped_count[NUM_LANES];           /* used only inside the ISR  */
-static uint32_t ped_first_ms[NUM_LANES];        /* time of first press       */
-static uint32_t btn_last_ms[NUM_BUTTONS];       /* debounce timestamps       */
+/* Pedestrian state */
+static uint8_t  ped_req[NUM_LANES];        /* button pushed, waiting        */
+static uint8_t  ped_elderly[NUM_LANES];    /* pushed 3x together            */
+static uint8_t  ped_count[NUM_LANES];
+static uint32_t ped_first_ms[NUM_LANES];
+static uint8_t  ped_serving = 0;           /* open lane is serving a request */
+static uint8_t  ped_serving_elderly = 0;
 
-/* Called from the interrupt: counts presses, detects "three together" */
+/* Emergency flags (set in interrupts) */
+static volatile uint8_t em_req[NUM_LANES];
+static uint32_t btn_last_ms[NUM_LANES];
+
+/* IR / queue */
+static uint8_t ir_stable[NUM_SENSORS];
+static uint8_t queue_len[NUM_LANES];
+static uint8_t expb_state = 0xFF;          /* last byte read from PCF8574 B */
+
+/* ===================================================================== */
+/*  Software I2C (open-drain, ~50 kHz) + PCF8574                          */
+/* ===================================================================== */
+static inline void scl_hi(void) { SCL_PORT->BSRR = (1u << SCL_PIN); }
+static inline void scl_lo(void) { SCL_PORT->BSRR = (1u << (SCL_PIN + 16)); }
+static inline void sda_hi(void) { SDA_PORT->BSRR = (1u << SDA_PIN); }
+static inline void sda_lo(void) { SDA_PORT->BSRR = (1u << (SDA_PIN + 16)); }
+static inline uint8_t sda_rd(void) { return (uint8_t)((SDA_PORT->IDR >> SDA_PIN) & 1u); }
+
+static void i2c_delay(void) { udelay(5); }
+
+static void i2c_init(void)
+{
+    gpio_set_output_od(SCL_PORT, SCL_PIN);
+    gpio_set_output_od(SDA_PORT, SDA_PIN);
+    sda_hi();
+    scl_hi();
+    /* free a slave that may be holding SDA low after a reset */
+    for (uint8_t i = 0; i < 9; i++) {
+        scl_lo(); i2c_delay();
+        scl_hi(); i2c_delay();
+    }
+}
+
+static void i2c_start(void)
+{
+    sda_hi(); scl_hi(); i2c_delay();
+    sda_lo(); i2c_delay();
+    scl_lo(); i2c_delay();
+}
+
+static void i2c_stop(void)
+{
+    sda_lo(); i2c_delay();
+    scl_hi(); i2c_delay();
+    sda_hi(); i2c_delay();
+}
+
+/* Returns 1 if the device acknowledged */
+static uint8_t i2c_write_byte(uint8_t b)
+{
+    for (uint8_t i = 0; i < 8; i++) {
+        if (b & 0x80u) sda_hi(); else sda_lo();
+        i2c_delay();
+        scl_hi(); i2c_delay();
+        scl_lo();
+        b = (uint8_t)(b << 1);
+    }
+    sda_hi();                    /* release SDA for the ACK bit */
+    i2c_delay();
+    scl_hi(); i2c_delay();
+    uint8_t ack = (uint8_t)!sda_rd();
+    scl_lo(); i2c_delay();
+    return ack;
+}
+
+static uint8_t i2c_read_byte(uint8_t ack)
+{
+    uint8_t v = 0;
+    sda_hi();
+    for (uint8_t i = 0; i < 8; i++) {
+        scl_hi(); i2c_delay();
+        v = (uint8_t)((v << 1) | sda_rd());
+        scl_lo(); i2c_delay();
+    }
+    if (ack) sda_lo(); else sda_hi();
+    i2c_delay();
+    scl_hi(); i2c_delay();
+    scl_lo(); i2c_delay();
+    sda_hi();
+    return v;
+}
+
+static uint8_t pcf_write(uint8_t addr, uint8_t v)
+{
+    i2c_start();
+    uint8_t ok = i2c_write_byte((uint8_t)(addr << 1));
+    if (ok) ok = i2c_write_byte(v);
+    i2c_stop();
+    return ok;
+}
+
+static uint8_t pcf_read(uint8_t addr, uint8_t *v)
+{
+    i2c_start();
+    uint8_t ok = i2c_write_byte((uint8_t)((addr << 1) | 1u));
+    if (ok) *v = i2c_read_byte(0);
+    i2c_stop();
+    return ok;
+}
+
+/* ===================================================================== */
+/*  16x2 LCD through a PCF8574 backpack                                   */
+/*  backpack bits: P0=RS P1=RW P2=EN P3=backlight P4..P7=D4..D7           */
+/* ===================================================================== */
+static uint8_t lcd_ok = 0;
+static char    lcd_want[2][16];
+static char    lcd_have[2][16];
+
+static uint8_t lcd_nibble(uint8_t nib, uint8_t rs)
+{
+    uint8_t b = (uint8_t)((nib << 4) | 0x08u | (rs ? 0x01u : 0x00u));
+    i2c_start();
+    uint8_t ok = i2c_write_byte((uint8_t)(LCD_ADDR << 1));
+    if (ok) {
+        i2c_write_byte((uint8_t)(b | 0x04u));   /* EN high */
+        i2c_write_byte(b);                      /* EN low  */
+    }
+    i2c_stop();
+    return ok;
+}
+
+static void lcd_byte(uint8_t v, uint8_t rs)
+{
+    lcd_nibble((uint8_t)(v >> 4), rs);
+    lcd_nibble((uint8_t)(v & 0x0Fu), rs);
+}
+
+static void lcd_init(void)
+{
+    delay_ms(50);
+    if (!lcd_nibble(0x3, 0)) { lcd_ok = 0; return; }   /* no LCD found */
+    lcd_ok = 1;
+    delay_ms(6);
+    lcd_nibble(0x3, 0); delay_ms(2);
+    lcd_nibble(0x3, 0); delay_ms(2);
+    lcd_nibble(0x2, 0); delay_ms(2);     /* switch to 4-bit mode      */
+    lcd_byte(0x28, 0);                   /* 4-bit, 2 lines, 5x8 font  */
+    lcd_byte(0x08, 0);                   /* display off               */
+    lcd_byte(0x01, 0); delay_ms(3);      /* clear                     */
+    lcd_byte(0x06, 0);                   /* cursor moves right        */
+    lcd_byte(0x0C, 0);                   /* display on, no cursor     */
+}
+
+/* two digits; 'pad' replaces a leading zero */
+static void put2(char *p, uint32_t v, char pad)
+{
+    p[0] = (v >= 10u) ? (char)('0' + (v / 10u) % 10u) : pad;
+    p[1] = (char)('0' + v % 10u);
+}
+
+static void lcd_build(void)
+{
+    for (uint8_t r = 0; r < 2; r++)
+        for (uint8_t c = 0; c < 16; c++) lcd_want[r][c] = ' ';
+
+    char *l1 = lcd_want[0];                     /* "L1 GREEN  --s"  */
+    l1[0] = 'L';
+    l1[1] = (char)('1' + active_lane);
+    const char *nm = phase_names[phase];
+    for (uint8_t i = 0; i < 5; i++) l1[3 + i] = nm[i];
+    if (phase == PH_GREEN_EXT) { l1[9] = '-'; l1[10] = '-'; }
+    else                       { put2(&l1[9], countdown_s, ' '); }
+    l1[11] = 's';
+
+    char *l2 = lcd_want[1];                     /* "Q 03 01 00 00 P" */
+    l2[0] = 'Q';
+    for (uint8_t l = 0; l < NUM_LANES; l++)
+        put2(&l2[2 + 3 * l], queue_len[l], '0');
+    l2[14] = ped_serving ? (ped_serving_elderly ? 'S' : 'P') : ' ';
+}
+
+/* Writes at most ONE changed character per call (keeps the loop fast) */
+static void lcd_step(void)
+{
+    static uint32_t last_build = 0;
+    static uint8_t  pos = 0;
+    static uint8_t  cur_row = 0xFF, cur_col = 0xFF;
+
+    if (!lcd_ok) return;
+    if ((ms_ticks - last_build) >= LCD_BUILD_MS) {
+        last_build = ms_ticks;
+        lcd_build();
+    }
+    for (uint8_t k = 0; k < 32; k++) {
+        uint8_t idx = (uint8_t)((pos + k) & 31u);
+        uint8_t r = (uint8_t)(idx >> 4);
+        uint8_t c = (uint8_t)(idx & 15u);
+        if (lcd_want[r][c] == lcd_have[r][c]) continue;
+
+        if (r != cur_row || c != cur_col)       /* set cursor if needed */
+            lcd_byte((uint8_t)(0x80u | (r ? 0x40u : 0x00u) | c), 0);
+        lcd_byte((uint8_t)lcd_want[r][c], 1);
+        lcd_have[r][c] = lcd_want[r][c];
+        cur_row = r;
+        cur_col = (uint8_t)(c + 1u);
+        pos = (uint8_t)((idx + 1u) & 31u);
+        return;
+    }
+}
+
+/* ===================================================================== */
+/*  TM1637 countdown displays (shared CLK, one DIO per lane)              */
+/* ===================================================================== */
+#define TM_BRIGHT   0x8A      /* display on, brightness 2 (0x88..0x8F) */
+#define SEG_DASH    0x40
+#define SEG_E       0x79
+
+static const uint8_t seg_digit[10] = {
+    0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
+};
+
+static void tm_delay(void) { udelay(5); }
+
+static void tm_start(uint8_t l)
+{
+    pin_write(&tm_dio[l], 1);
+    pin_write(&tm_clk, 1);
+    tm_delay();
+    pin_write(&tm_dio[l], 0);
+    tm_delay();
+}
+
+static void tm_stop(uint8_t l)
+{
+    pin_write(&tm_clk, 0);
+    tm_delay();
+    pin_write(&tm_dio[l], 0);
+    tm_delay();
+    pin_write(&tm_clk, 1);
+    tm_delay();
+    pin_write(&tm_dio[l], 1);
+    tm_delay();
+}
+
+static void tm_write_byte(uint8_t l, uint8_t b)
+{
+    for (uint8_t i = 0; i < 8; i++) {           /* LSB first */
+        pin_write(&tm_clk, 0);
+        pin_write(&tm_dio[l], (uint8_t)(b & 1u));
+        tm_delay();
+        pin_write(&tm_clk, 1);
+        tm_delay();
+        b = (uint8_t)(b >> 1);
+    }
+    /* ACK clock: let the module pull DIO low (we do not check it) */
+    pin_write(&tm_clk, 0);
+    gpio_set_input_pullup(tm_dio[l].port, tm_dio[l].pin);
+    tm_delay();
+    pin_write(&tm_clk, 1);
+    tm_delay();
+    pin_write(&tm_clk, 0);
+    pin_write(&tm_dio[l], 0);                   /* ODR=0 before output mode */
+    gpio_set_output(tm_dio[l].port, tm_dio[l].pin);
+}
+
+static void tm_show(uint8_t l, const uint8_t seg[4])
+{
+    tm_start(l); tm_write_byte(l, 0x40); tm_stop(l);        /* auto-increment */
+    tm_start(l);
+    tm_write_byte(l, 0xC0);                                  /* first digit    */
+    for (uint8_t i = 0; i < 4; i++) tm_write_byte(l, seg[i]);
+    tm_stop(l);
+    tm_start(l); tm_write_byte(l, TM_BRIGHT); tm_stop(l);   /* display on     */
+}
+
+/* What this lane's display should show right now */
+static void tm_lane_segments(uint8_t lane, uint8_t seg[4])
+{
+    seg[0] = 0; seg[1] = 0; seg[2] = 0; seg[3] = 0;
+    if (lane != active_lane) return;                 /* waiting lanes: blank */
+
+    uint32_t s = countdown_s;
+    if (s > 99u) s = 99u;
+
+    switch (phase) {
+    case PH_GREEN_EXT:                               /* "--"                 */
+        seg[2] = SEG_DASH; seg[3] = SEG_DASH;
+        break;
+    case PH_GREEN_CLEAR:                             /* " 9" ... " 1"        */
+    case PH_EM_GREEN:                                /* "E 12" ... "E  1"    */
+        if (phase == PH_EM_GREEN) seg[0] = SEG_E;
+        if (s >= 10u) seg[2] = seg_digit[s / 10u];
+        seg[3] = seg_digit[s % 10u];
+        break;
+    case PH_YELLOW:                                  /* countdown hit "00"   */
+        seg[2] = seg_digit[0]; seg[3] = seg_digit[0];
+        break;
+    default:
+        break;
+    }
+}
+
+/* Refreshes ONE lane's module per call, and only when its content changed */
+static void displays_update(void)
+{
+    static uint8_t shown[NUM_LANES][4];
+    static uint8_t valid[NUM_LANES];
+    static uint8_t next = 0;
+
+    uint8_t l = next;
+    next = (uint8_t)((next + 1u) % NUM_LANES);
+
+    uint8_t seg[4];
+    tm_lane_segments(l, seg);
+
+    if (valid[l] && seg[0] == shown[l][0] && seg[1] == shown[l][1] &&
+        seg[2] == shown[l][2] && seg[3] == shown[l][3]) return;
+
+    tm_show(l, seg);
+    for (uint8_t i = 0; i < 4; i++) shown[l][i] = seg[i];
+    valid[l] = 1;
+}
+
+/* ===================================================================== */
+/*  Buzzer                                                                */
+/* ===================================================================== */
+static uint8_t  bz_beeps = 0;     /* acknowledgement beeps still to play */
+static uint8_t  bz_on    = 0;
+static uint32_t bz_t     = 0;
+
+static void buzzer_beeps(uint8_t n)
+{
+    bz_beeps = n;
+    bz_on    = 0;
+    bz_t     = ms_ticks;
+}
+
+static void buzzer_update(void)
+{
+    uint8_t level = 0;
+
+    if (bz_beeps > 0) {                                  /* ack beeps first */
+        if ((int32_t)(ms_ticks - bz_t) >= 0) {
+            if (!bz_on) { bz_on = 1; bz_t = ms_ticks + BEEP_ON_MS; }
+            else        { bz_on = 0; bz_beeps--; bz_t = ms_ticks + BEEP_OFF_MS; }
+        }
+        level = bz_on;
+    } else if (ped_serving) {                            /* walk / clearance */
+        uint32_t m = ms_ticks;
+        if (phase == PH_GREEN_EXT)        level = (m % 1000u) < 80u;  /* slow tick */
+        else if (phase == PH_GREEN_CLEAR) level = (m % 300u) < 100u;  /* fast tick */
+    }
+    pin_write(&buzzer_pin, level);
+}
+
+/* ===================================================================== */
+/*  Pedestrian requests                                                   */
+/* ===================================================================== */
+
+/* Called when a pedestrian button press is confirmed */
 static void ped_press(uint8_t lane, uint32_t now)
 {
     if (ped_count[lane] == 0 || (now - ped_first_ms[lane]) > PED_MULTI_WINDOW_MS) {
-        ped_count[lane]    = 1;          /* start a new press sequence */
+        ped_count[lane]    = 1;
         ped_first_ms[lane] = now;
+        buzzer_beeps(1);
     } else {
         ped_count[lane]++;
+        buzzer_beeps(1);
     }
     if (ped_count[lane] >= PED_MULTI_COUNT) {
-        ped_elderly[lane] = 1;           /* third press: elderly mode  */
+        ped_elderly[lane] = 1;           /* third press: elderly mode */
         ped_count[lane]   = 0;
+        buzzer_beeps(3);
     }
     ped_req[lane] = 1;
 }
 
-/* Handles every pending button interrupt (shared by all EXTI handlers) */
-static void exti_service(void)
+/* Minimum green this lane's pedestrian needs (0 = none); optionally clears */
+static uint32_t ped_need_ms(uint8_t lane, uint8_t clear)
 {
-    uint32_t pending = EXTI->PR;
-    for (uint8_t i = 0; i < NUM_BUTTONS; i++) {
-        uint32_t bit = 1u << buttons[i].pin;
-        if (!(pending & bit)) continue;
+    uint32_t need = 0;
+    if (ped_elderly[lane])   need = PED_ELDERLY_MIN_GREEN_MS;
+    else if (ped_req[lane])  need = PED_MIN_GREEN_MS;
+    if (clear) { ped_req[lane] = 0; ped_elderly[lane] = 0; }
+    return need;
+}
 
-        EXTI->PR = bit;                              /* clear (write 1)   */
+/* Pedestrian button pressed while the lane is already in its extension
+ * phase: accepted only if the minimum time has not yet been reached,
+ * otherwise it waits for the next green of this lane. */
+static void ped_update_during_ext(uint32_t elapsed)
+{
+    uint32_t need = ped_need_ms(active_lane, 0);
+    if (need == 0 || elapsed >= need) return;
+    ped_serving = 1;
+    if (need >= PED_ELDERLY_MIN_GREEN_MS) ped_serving_elderly = 1;
+    if (ext_floor_ms < need) ext_floor_ms = need;
+    (void)ped_need_ms(active_lane, 1);
+}
 
-        uint32_t now = ms_ticks;
-        if ((now - btn_last_ms[i]) < BTN_DEBOUNCE_MS) continue;  /* bounce */
-        btn_last_ms[i] = now;
+/* 8-bit mask of pedestrian LEDs that should be ON (bit 2c = walk,
+ * bit 2c+1 = don't walk, for crossing c) */
+static uint8_t ped_led_mask(void)
+{
+    uint8_t mask  = 0;
+    uint8_t blink = (uint8_t)((ms_ticks / 250u) & 1u);
 
-        if (buttons[i].kind == BTN_EMERGENCY) em_req[buttons[i].lane] = 1;
-        else                                  ped_press(buttons[i].lane, now);
+    for (uint8_t c = 0; c < NUM_LANES; c++) {
+        uint8_t walk = 0, dont = 1;                  /* default: don't walk */
+        if (c == active_lane && ped_serving) {
+            if (phase == PH_GREEN_EXT) {
+                walk = 1; dont = 0;
+            } else if (phase == PH_GREEN_CLEAR ||
+                       (phase == PH_YELLOW && em_next != NO_LANE)) {
+                dont = blink;                        /* flashing clearance   */
+            }
+        }
+        if (walk) mask |= (uint8_t)(1u << (2u * c));
+        if (dont) mask |= (uint8_t)(1u << (2u * c + 1u));
+    }
+    return mask;
+}
+
+static void ped_leds_update(void)
+{
+    static uint8_t last = 0;
+    static uint8_t first = 1;
+    uint8_t mask = ped_led_mask();
+    if (first || mask != last) {
+        first = 0;
+        last  = mask;
+        pcf_write(EXPA_ADDR, (uint8_t)~mask);        /* LEDs are active-low */
     }
 }
 
-void EXTI3_IRQHandler(void)     { exti_service(); }   /* PB3            */
-void EXTI4_IRQHandler(void)     { exti_service(); }   /* PB4            */
-void EXTI9_5_IRQHandler(void)   { exti_service(); }   /* PB5 PB6 PB7 PB8 */
-void EXTI15_10_IRQHandler(void) { exti_service(); }   /* PA11 PA15      */
-
-static void buttons_init(void)
+/* ===================================================================== */
+/*  Inputs: IR sensors (direct + via PCF8574 B) and pedestrian buttons    */
+/* ===================================================================== */
+static inline uint8_t ir_raw(uint8_t s)              /* 1 = vehicle present */
 {
-    for (uint8_t i = 0; i < NUM_BUTTONS; i++) {
-        uint8_t pin = buttons[i].pin;
-        gpio_set_input_pullup(buttons[i].port, pin);
-
-        /* Route this pin to its EXTI line: EXTICR[pin/4], 4 bits per pin,
-         * port code A=0, B=1 */
-        uint8_t idx = pin >> 2;
-        uint8_t sh  = (uint8_t)((pin & 3u) * 4u);
-        AFIO->EXTICR[idx] &= ~(0xFu << sh);
-        AFIO->EXTICR[idx] |= ((buttons[i].port == GPIOB) ? 1u : 0u) << sh;
-
-        EXTI->FTSR |= (1u << pin);   /* trigger on falling edge (press)   */
-        EXTI->PR    = (1u << pin);   /* clear any stale flag              */
-        EXTI->IMR  |= (1u << pin);   /* unmask the interrupt              */
-    }
-    NVIC_EnableIRQ(EXTI3_IRQn);
-    NVIC_EnableIRQ(EXTI4_IRQn);
-    NVIC_EnableIRQ(EXTI9_5_IRQn);
-    NVIC_EnableIRQ(EXTI15_10_IRQn);
+    uint8_t bit;
+    if (s < 4) bit = (uint8_t)((GPIOB->IDR >> (12u + s)) & 1u);  /* PB12..15 */
+    else       bit = (uint8_t)((expb_state >> s) & 1u);          /* P4..P7   */
+    return IR_ACTIVE_LOW ? (uint8_t)!bit : bit;
 }
 
-/* ---------- IR vehicle counting ---------- */
-static uint8_t ir_stable[NUM_SENSORS];     /* debounced sensor state       */
-static uint8_t queue_len[NUM_LANES];       /* vehicles waiting, per lane   */
-
-/* Raw sensor reading: 1 = vehicle present */
-static inline uint8_t ir_raw(uint8_t sensor)
-{
-    const PinDef *p = &ir_pins[sensor];
-    uint8_t bit = (p->port->IDR >> p->pin) & 1u;
-    return IR_ACTIVE_LOW ? !bit : bit;
-}
-
-/* One vehicle just blocked this sensor: update the lane that owns it */
 static void count_event(uint8_t sensor)
 {
     for (uint8_t l = 0; l < NUM_LANES; l++) {
@@ -278,13 +626,35 @@ static void count_event(uint8_t sensor)
     }
 }
 
-static void ir_update(void)
+static void ped_buttons_update(uint8_t raw)          /* raw bits 0..3 */
+{
+    static uint8_t stable[NUM_LANES];                /* 1 = pressed */
+    static uint8_t agree[NUM_LANES];
+
+    for (uint8_t l = 0; l < NUM_LANES; l++) {
+        uint8_t r = (uint8_t)!((raw >> l) & 1u);
+        if (r != stable[l]) {
+            if (++agree[l] >= BTN_DEBOUNCE_N) {
+                stable[l] = r;
+                agree[l]  = 0;
+                if (r) ped_press(l, ms_ticks);
+            }
+        } else {
+            agree[l] = 0;
+        }
+    }
+}
+
+static void inputs_update(void)
 {
     static uint32_t last_sample = 0;
-    static uint8_t  agree[NUM_SENSORS];  /* consecutive differing samples */
+    static uint8_t  agree[NUM_SENSORS];
 
     if ((ms_ticks - last_sample) < IR_SAMPLE_MS) return;
     last_sample = ms_ticks;
+
+    uint8_t b;
+    expb_state = pcf_read(EXPB_ADDR, &b) ? b : 0xFFu;   /* missing = idle */
 
     for (uint8_t s = 0; s < NUM_SENSORS; s++) {
         uint8_t r = ir_raw(s);
@@ -292,68 +662,89 @@ static void ir_update(void)
             if (++agree[s] >= IR_DEBOUNCE_N) {
                 ir_stable[s] = r;
                 agree[s]     = 0;
-                if (r) count_event(s);   /* clear -> blocked = one vehicle */
+                if (r) count_event(s);       /* clear -> blocked = 1 vehicle */
             }
         } else {
             agree[s] = 0;
         }
     }
+
+    ped_buttons_update(expb_state);
 }
 
-/* ---------- Pedestrian requests (main-loop side) ---------- */
-
-/* Minimum green this lane's pedestrian needs (0 = none). Also clears the
- * request when 'clear' is non-zero. Interrupts are blocked for a moment so
- * the button ISR cannot change the flags halfway through. */
-static uint32_t ped_need_ms(uint8_t lane, uint8_t clear)
+/* ===================================================================== */
+/*  Emergency buttons (EXTI interrupts, active-low)                       */
+/* ===================================================================== */
+static void exti_service(void)
 {
-    uint32_t need = 0;
-    __disable_irq();
-    if (ped_elderly[lane])   need = PED_ELDERLY_MIN_GREEN_MS;
-    else if (ped_req[lane])  need = PED_MIN_GREEN_MS;
-    if (clear) { ped_req[lane] = 0; ped_elderly[lane] = 0; }
-    __enable_irq();
-    return need;
-}
+    uint32_t pending = EXTI->PR;
+    for (uint8_t l = 0; l < NUM_LANES; l++) {
+        uint32_t bit = 1u << em_pins[l].pin;
+        if (!(pending & bit)) continue;
 
-/* Called when a lane turns green: queue (+ pedestrian) -> green time */
-static uint32_t compute_green_ms(uint8_t lane)
-{
-    uint32_t ms = MIN_GREEN_MS + (uint32_t)queue_len[lane] * MS_PER_VEHICLE;
-
-    if (recovery_left > 0) {              /* after an emergency: longer green */
-        ms += RECOVERY_BONUS_MS;
-        recovery_left--;
+        EXTI->PR = bit;                                   /* clear (write 1) */
+        uint32_t now = ms_ticks;
+        if ((now - btn_last_ms[l]) < BTN_DEBOUNCE_MS) continue;   /* bounce */
+        btn_last_ms[l] = now;
+        em_req[l] = 1;
     }
-    if (ms > MAX_GREEN_MS) ms = MAX_GREEN_MS;
-
-    uint32_t need = ped_need_ms(lane, 1); /* pedestrian waiting: guarantee it */
-    if (ms < need) ms = need;
-    return ms;
 }
 
-/* Button pressed while this lane is ALREADY green: lengthen the green only
- * if the minimum time has not been reached yet; a late press waits for
- * the next green of this lane. */
-static void ped_update_during_green(uint32_t elapsed)
+void EXTI3_IRQHandler(void)     { exti_service(); }   /* PB3       */
+void EXTI4_IRQHandler(void)     { exti_service(); }   /* PB4       */
+void EXTI9_5_IRQHandler(void)   { exti_service(); }   /* PB5, PB6  */
+
+static void emergency_init(void)
 {
-    uint32_t need = ped_need_ms(active_lane, 0);       /* peek only */
-    if (need == 0 || elapsed >= need) return;
-    if (phase_len < need) phase_len = need;
-    (void)ped_need_ms(active_lane, 1);                 /* now clear  */
+    for (uint8_t l = 0; l < NUM_LANES; l++) {
+        uint8_t pin = em_pins[l].pin;
+        gpio_set_input_pullup(em_pins[l].port, pin);
+
+        uint8_t idx = (uint8_t)(pin >> 2);
+        uint8_t sh  = (uint8_t)((pin & 3u) * 4u);
+        AFIO->EXTICR[idx] &= ~(0xFu << sh);
+        AFIO->EXTICR[idx] |= 1u << sh;               /* port B = 1 */
+
+        EXTI->FTSR |= (1u << pin);                   /* falling edge */
+        EXTI->PR    = (1u << pin);
+        EXTI->IMR  |= (1u << pin);
+    }
+    NVIC_EnableIRQ(EXTI3_IRQn);
+    NVIC_EnableIRQ(EXTI4_IRQn);
+    NVIC_EnableIRQ(EXTI9_5_IRQn);
 }
 
-/* ---------- State machine ---------- */
+/* ===================================================================== */
+/*  State machine                                                         */
+/* ===================================================================== */
 static void enter_phase(Phase p)
 {
     phase       = p;
     phase_start = ms_ticks;
 
     switch (p) {
-    case PH_GREEN:
+    case PH_GREEN_EXT: {
         all_lanes_red();
         lane_set(active_lane, GREEN);
-        phase_len = compute_green_ms(active_lane);
+
+        ext_floor_ms = EXT_MIN_MS;
+        if (recovery_left > 0) {                 /* after an emergency */
+            ext_floor_ms += RECOVERY_BONUS_MS;
+            recovery_left--;
+        }
+        if (ext_floor_ms > EXT_MAX_MS) ext_floor_ms = EXT_MAX_MS;
+
+        uint32_t need = ped_need_ms(active_lane, 1);  /* pedestrian waiting */
+        ped_serving         = (need > 0u);
+        ped_serving_elderly = (need >= PED_ELDERLY_MIN_GREEN_MS);
+        if (ext_floor_ms < need) ext_floor_ms = need;
+
+        phase_len = EXT_MAX_MS;                  /* upper limit only */
+        break;
+    }
+
+    case PH_GREEN_CLEAR:                         /* lights stay green */
+        phase_len = COUNTDOWN_MS;
         break;
 
     case PH_YELLOW:
@@ -363,46 +754,50 @@ static void enter_phase(Phase p)
 
     case PH_ALL_RED:
         all_lanes_red();
+        ped_serving = 0;
+        ped_serving_elderly = 0;
         phase_len = ALL_RED_MS;
         break;
 
     case PH_EM_GREEN:
         all_lanes_red();
         lane_set(active_lane, GREEN);
+        ped_serving = 0;
+        ped_serving_elderly = 0;
         phase_len     = EMERGENCY_GREEN_MS;
-        recovery_left = RECOVERY_GREENS;   /* recovery starts after this */
+        recovery_left = RECOVERY_GREENS;
         break;
     }
 }
 
-/* Looks at emergency requests set by the interrupts */
 static void check_emergency(void)
 {
     uint8_t lane = NO_LANE;
     for (uint8_t l = 0; l < NUM_LANES; l++) {
-        if (em_req[l]) { lane = l; break; }       /* lowest lane first */
+        if (em_req[l]) { lane = l; break; }           /* lowest lane first */
     }
     if (lane == NO_LANE) return;
 
     switch (phase) {
     case PH_EM_GREEN:
-        if (lane == active_lane) {                /* vehicle still coming: */
-            em_req[lane] = 0;                     /* restart the 12 s      */
-            phase_start  = ms_ticks;
+        if (lane == active_lane) {                    /* vehicle still coming */
+            em_req[lane] = 0;
+            phase_start  = ms_ticks;                  /* restart the 12 s     */
         }
-        break;                                    /* other lanes wait      */
+        break;                                        /* other lanes wait     */
 
-    case PH_GREEN:
+    case PH_GREEN_EXT:
+    case PH_GREEN_CLEAR:
         em_req[lane] = 0;
         if (lane == active_lane) {
-            enter_phase(PH_EM_GREEN);             /* already green: hold   */
+            enter_phase(PH_EM_GREEN);                 /* already green: hold  */
         } else {
-            em_next = lane;                       /* yellow, then lane E   */
+            em_next = lane;                           /* yellow, then lane E  */
             enter_phase(PH_YELLOW);
         }
         break;
 
-    case PH_YELLOW:                               /* yellow already running */
+    case PH_YELLOW:                                   /* yellow already running */
         if (em_next == NO_LANE) {
             em_next      = lane;
             em_req[lane] = 0;
@@ -419,18 +814,24 @@ static void check_emergency(void)
 
 static void signal_update(void)
 {
-    uint32_t elapsed = ms_ticks - phase_start;   /* wrap-safe (unsigned) */
+    uint32_t elapsed = ms_ticks - phase_start;       /* wrap-safe (unsigned) */
 
-    if (phase == PH_GREEN) ped_update_during_green(elapsed);
-
-    if (elapsed >= phase_len) {
+    if (phase == PH_GREEN_EXT) {
+        ped_update_during_ext(elapsed);
+        /* Decision point: minimum time done AND (queue empty OR cap hit) */
+        if (elapsed >= ext_floor_ms &&
+            (queue_len[active_lane] == 0 || elapsed >= EXT_MAX_MS)) {
+            enter_phase(PH_GREEN_CLEAR);
+            elapsed = 0;
+        }
+    } else if (elapsed >= phase_len) {
         switch (phase) {
-        case PH_GREEN:
+        case PH_GREEN_CLEAR:
         case PH_EM_GREEN:
             enter_phase(PH_YELLOW);
             break;
         case PH_YELLOW:
-            if (em_next != NO_LANE) {             /* straight to emergency */
+            if (em_next != NO_LANE) {                /* straight to emergency */
                 active_lane = em_next;
                 em_next     = NO_LANE;
                 enter_phase(PH_EM_GREEN);
@@ -439,26 +840,30 @@ static void signal_update(void)
             }
             break;
         case PH_ALL_RED:
-            active_lane = (active_lane + 1) % NUM_LANES;
-            enter_phase(PH_GREEN);
+            active_lane = (uint8_t)((active_lane + 1u) % NUM_LANES);
+            enter_phase(PH_GREEN_EXT);
+            break;
+        default:
             break;
         }
         elapsed = 0;
     }
 
-    /* round up so display shows 1 (not 0) during the final second */
-    countdown_s = (phase_len - elapsed + 999u) / 1000u;
+    if (phase == PH_GREEN_EXT || elapsed >= phase_len) countdown_s = 0;
+    else countdown_s = (phase_len - elapsed + 999u) / 1000u;   /* round up */
 }
 
-/* ---------- main ---------- */
+/* ===================================================================== */
+/*  main                                                                  */
+/* ===================================================================== */
 int main(void)
 {
-    /* Clocks: GPIOA, GPIOB, GPIOC and AFIO (needed for EXTI + JTAG setting) */
+    /* Clocks: GPIOA, GPIOB, GPIOC and AFIO (EXTI + JTAG setting) */
     RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN |
                     RCC_APB2ENR_IOPCEN | RCC_APB2ENR_AFIOEN;
 
     /* Free PB3, PB4, PA15 from JTAG but KEEP SWD (SWJ_CFG = 0b010) so the
-     * ST-Link still works. Never write 0b100 here: it disables SWD too. */
+     * ST-Link still works. Never write 0b100: it disables SWD too. */
     AFIO->MAPR = (AFIO->MAPR & ~(0x7u << 24)) | (0x2u << 24);
 
     /* 12 traffic LEDs */
@@ -466,21 +871,43 @@ int main(void)
         for (uint8_t c = 0; c < 3; c++)
             gpio_set_output(lane_pins[l][c].port, lane_pins[l][c].pin);
 
-    /* 8 IR sensors as inputs with pull-up; start from their CURRENT state so
-     * a sensor already blocked at power-up is not counted as a vehicle */
-    for (uint8_t s = 0; s < NUM_SENSORS; s++) {
-        gpio_set_input_pullup(ir_pins[s].port, ir_pins[s].pin);
-        ir_stable[s] = ir_raw(s);
+    /* Direct IR inputs s0..s3 on PB12..PB15 (pull-up) */
+    for (uint8_t s = 0; s < 4; s++)
+        gpio_set_input_pullup(GPIOB, (uint8_t)(12u + s));
+
+    /* Buzzer (off) */
+    gpio_set_output(buzzer_pin.port, buzzer_pin.pin);
+    pin_write(&buzzer_pin, 0);
+
+    /* TM1637 pins: clock and the 4 data lines idle high */
+    gpio_set_output(tm_clk.port, tm_clk.pin);
+    pin_write(&tm_clk, 1);
+    for (uint8_t l = 0; l < NUM_LANES; l++) {
+        gpio_set_output(tm_dio[l].port, tm_dio[l].pin);
+        pin_write(&tm_dio[l], 1);
     }
 
-    /* Onboard LED PC13 (active-low) used as a heartbeat */
+    /* Heartbeat LED PC13 (active-low) */
     gpio_set_output(GPIOC, 13);
 
-    /* 1 ms tick */
+    /* 1 ms tick (needed before the LCD start-up delays) */
     SysTick_Config(SystemCoreClock / 1000u);
 
-    /* 8 buttons with interrupts */
-    buttons_init();
+    /* I2C devices: expanders idle (LEDs off, inputs released), then LCD */
+    i2c_init();
+    pcf_write(EXPA_ADDR, 0xFF);
+    pcf_write(EXPB_ADDR, 0xFF);
+    lcd_init();
+
+    /* Start the IR debounce from the CURRENT state, so a sensor already
+     * blocked at power-up is not counted as a vehicle */
+    {
+        uint8_t b;
+        expb_state = pcf_read(EXPB_ADDR, &b) ? b : 0xFFu;
+        for (uint8_t s = 0; s < NUM_SENSORS; s++) ir_stable[s] = ir_raw(s);
+    }
+
+    emergency_init();
 
     all_lanes_red();
     enter_phase(PH_ALL_RED);
@@ -488,19 +915,18 @@ int main(void)
     uint32_t last_beat = 0;
 
     while (1) {
-        ir_update();
-        check_emergency();
-        signal_update();
+        inputs_update();        /* IR counting + pedestrian buttons   */
+        check_emergency();      /* flags set by the EXTI interrupts   */
+        signal_update();        /* light sequence and countdown       */
+        buzzer_update();
+        ped_leds_update();
+        displays_update();      /* one TM1637 module per pass         */
+        lcd_step();             /* one LCD character per pass         */
 
-        /* Heartbeat: toggles every 250 ms (proves loop is non-blocking) */
+        /* Heartbeat: toggles every 250 ms (proves loop is running) */
         if ((ms_ticks - last_beat) >= 250u) {
             last_beat = ms_ticks;
             GPIOC->ODR ^= (1u << 13);
         }
-
-        /* --- Future hooks ---
-         * lcd_update();   // show active_lane, phase, countdown_s
-         * display/pedestrian-LED/buzzer outputs
-         */
     }
 }
