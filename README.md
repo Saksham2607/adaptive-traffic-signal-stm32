@@ -8,6 +8,6 @@ If the push button for pedestrian mode is pressed thrice within 1-2 seconds, it 
 Emergency mode for ambulance, fire trucks has also been initiated, where push buttons and buzzers are used. When the emergency button is 
 pressed for that particular lane, the signals for all other lanes turn red and only that particular lane is given green signal.
 
-We have used register level C programming to implement this in STM32CubeIDE, and it was flashed using STM32CubePrg
+Register level C programming is used to implement this in STM32CubeIDE, and it was flashed using STM32CubePrg
 Hardware: STM32F103C8T6(Blue pill), ST Link v2,12 LEDs(Red, Yellow Green), 4 7-segment displays TM1637(for timer of each lane), 8 IR sensors, I2C expanders,4 Buzzers, 8 push buttons(2 per lane- one for emergency, one for pedestrian)
 Software: STM32CubeIDE,STM32CubePrg, CMSIS device headers(Register definitions for STM32F103), UART Terminal(to help check counts, and fault messages while testing)
