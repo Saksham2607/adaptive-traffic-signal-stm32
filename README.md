@@ -1,7 +1,7 @@
 This project showcases how a lane can be given a priority based on vehicular density so that the timers given to the green signal in each lane
 is according to how much traffic is there per lane, which solves the problem of fixed timers, so that the empty and filled lanes both
 do not get the same green time signal.
-The vehicular density is calculated by |Number of incoming vehicles - Number of Outgoing vehicles|, fow which each lane has 2 IR sensors,
+The vehicular density is calculated by |Number of incoming vehicles - Number of Outgoing vehicles|, for which each lane has 2 IR sensors,
 one for incoming vehicle count,and one for outgoing.
 We have also included pedestrian priority , where the push buttons are used to activate pedestrian mode. 
 If the push button for pedestrian mode is pressed thrice within 1-2 seconds, it switches to elderly mode, where we get prolonged time pedestrian.
