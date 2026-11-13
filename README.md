@@ -1,6 +1,6 @@
 # Adaptive Traffic Signal Controller (STM32)
 
-A four-lane traffic signal that changes how long each lane stays green based on how many vehicles are waiting. It runs on an STM32F103C8T6 (Blue Pill), written in bare-metal C with no HAL and no RTOS. We built it as a mini project for the Microprocessor Lab at MIT Manipal.
+A four-lane traffic signal that changes how long each lane stays green based on how many vehicles are waiting. It runs on an STM32F103C8T6 (Blue Pill), written in bare-metal C with no HAL and no RTOS.
 
 ## Why we built it
 
