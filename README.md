@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🚦 Adaptive Traffic Signal Controller
+#  Adaptive Traffic Signal Controller
 
 **A 4-lane, queue-based traffic signal on an STM32 (bare-metal, register-level C) that adapts green time to real-time vehicle counts, with pedestrian and emergency-vehicle priority.**
 
