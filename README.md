@@ -180,6 +180,6 @@ Green time min and max time allocation, queue and timing logic, interrupt handli
 
 <div align="center">
 
-**Built by [Saksham](https://github.com/Saksham2607)**
+
 
 </div>
