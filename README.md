@@ -13,7 +13,7 @@
 
 ---
 
-## 📌 Overview
+## Overview
 
 Fixed-timer signals give an empty lane the same green time as a congested one, which wastes time, fuel, and patience. This project replaces fixed timers with **real-time queue estimation**: IR sensors count vehicles entering and leaving each lane, and the firmware converts the queue length into a green duration.
 
@@ -26,7 +26,7 @@ Built as a Microprocessor Lab project at MIT Manipal, running entirely on a ~$2 
 
 ---
 
-## ✨ Key Features
+## Key Features
 
 | Feature | Details |
 |---|---|
@@ -41,7 +41,7 @@ Built as a Microprocessor Lab project at MIT Manipal, running entirely on a ~$2 
 
 ---
 
-## 🧠 How It Works
+## How It Works
 
 ### Signal cycle
 
@@ -98,7 +98,7 @@ Button presses trigger EXTI interrupts that **only set flags**. The main loop ch
 
 ---
 
-## 💻 Software and Tools
+##  Software and Tools
 
 - **Language:** C, **register-level** using CMSIS device headers (no HAL, no RTOS)
 - **IDE:** STM32CubeIDE
@@ -108,7 +108,7 @@ Button presses trigger EXTI interrupts that **only set flags**. The main loop ch
 
 ---
 
-## 📂 Repository Structure
+##  Repository Structure
 
 ```
 ├── Inc/                      # Header files
@@ -120,7 +120,7 @@ Button presses trigger EXTI interrupts that **only set flags**. The main loop ch
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
 1. **Clone the repo**
    ```bash
@@ -133,7 +133,7 @@ Button presses trigger EXTI interrupts that **only set flags**. The main loop ch
 
 ---
 
-## 🧪 Testing and Results
+##  Testing and Results
 
 | Area | What was checked | How |
 |---|---|---|
@@ -145,7 +145,7 @@ Button presses trigger EXTI interrupts that **only set flags**. The main loop ch
 
 ---
 
-## ⚠️ Limitations and Future Work
+##  Limitations and Future Work
 
 **Current limitations**
 
@@ -166,12 +166,12 @@ Button presses trigger EXTI interrupts that **only set flags**. The main loop ch
 
 ---
 
-## 👤 My Contribution
+## My Contribution
 Green time min and max time allocation, queue and timing logic, interrupt handling, displays, hardware assembly, testing
 
 ---
 
-## 🛠 Skills Demonstrated
+## Skills Demonstrated
 
 `Embedded C` · `STM32 / ARM Cortex-M3` · `Bare-metal / register-level programming` · `SysTick and non-blocking state machines` · `EXTI interrupts` · `I²C` · `UART` · `Sensor interfacing and debouncing` · `Real-time system design`
 
