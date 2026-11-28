@@ -22,7 +22,7 @@ It also handles two cases that fixed timers ignore:
 - **Pedestrians:** a crossing request with an extended mode for slower walkers.
 - **Emergency vehicles:** a dedicated priority phase for ambulances and fire trucks.
 
-Built as a Microprocessor Lab project at MIT Manipal, running entirely on a ~$2 Blue Pill board with no HAL and no RTOS.
+Built as a Microprocessor Lab project at MIT Manipal, running entirely on Blue Pill board with no HAL and no RTOS.
 
 ---
 
